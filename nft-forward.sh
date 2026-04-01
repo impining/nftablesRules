@@ -4,12 +4,14 @@ set -e
 
 CONFIG_FILE="/etc/nftables.conf"
 BACKUP_FILE="/etc/nftables.conf.bak"
+
 RULES=""
 SNAT_MODE="masquerade"
 SNAT_IP=""
 
-# 自动获取出口网卡
-WAN_IF=$(ip route get 1 | awk '{print $5; exit}')
+# 自动获取出口网卡（带兜底）
+WAN_IF=$(ip route | awk '/default/ {print $5; exit}')
+WAN_IF=${WAN_IF:-eth0}
 
 # =========================
 # 工具函数
@@ -30,8 +32,8 @@ disable_iptables() {
     echo "[+] 关闭 iptables..."
     systemctl stop iptables 2>/dev/null || true
     systemctl disable iptables 2>/dev/null || true
-    iptables -F || true
-    iptables -t nat -F || true
+    iptables -F 2>/dev/null || true
+    iptables -t nat -F 2>/dev/null || true
 }
 
 install_nft() {
@@ -43,30 +45,31 @@ install_nft() {
 }
 
 backup_config() {
-    echo "[+] 备份旧配置..."
+    echo "[+] 备份配置..."
     cp $CONFIG_FILE $BACKUP_FILE 2>/dev/null || true
 }
 
 rollback() {
-    echo "[!] 配置失败，正在回滚..."
+    echo "[!] 发生错误，回滚配置..."
     cp $BACKUP_FILE $CONFIG_FILE 2>/dev/null || true
     systemctl restart nftables
     exit 1
 }
 
 # =========================
-# 规则输入
+# 输入规则
 # =========================
 
 add_rules() {
     while true; do
         echo "---------------------------"
-        read -p "入站端口（回车结束）: " IN_PORT
+
+        read -r -p "入站端口（回车结束）: " IN_PORT || continue
         [ -z "$IN_PORT" ] && break
 
-        read -p "目标 IP: " DEST_IP
-        read -p "目标端口: " DEST_PORT
-        read -p "协议 (tcp/udp/both): " PROTO
+        read -r -p "目标 IP: " DEST_IP || continue
+        read -r -p "目标端口: " DEST_PORT || continue
+        read -r -p "协议 (tcp/udp/both): " PROTO || continue
 
         case $PROTO in
             tcp)
@@ -92,13 +95,13 @@ add_rules() {
 
 set_snat() {
     echo "SNAT 模式："
-    echo "1. 自动 (masquerade) [推荐]"
+    echo "1. 自动 (masquerade)"
     echo "2. 指定出口 IP"
 
-    read -p "选择: " CHOICE
+    read -r -p "选择: " CHOICE || return
 
     if [ "$CHOICE" == "2" ]; then
-        read -p "请输入出口 IP: " SNAT_IP
+        read -r -p "请输入出口 IP: " SNAT_IP || return
         SNAT_MODE="snat"
     else
         SNAT_MODE="masquerade"
@@ -148,7 +151,7 @@ table inet filter {
         iif lo accept
         ct state established,related accept
 
-        # 防断线关键规则（SSH）
+        # 防 SSH 断线（重要）
         tcp dport 22 accept
     }
 }
@@ -156,42 +159,32 @@ EOF
 }
 
 # =========================
-# 应用配置（带回滚）
+# 应用配置
 # =========================
 
 apply_config() {
     echo "[+] 检查配置..."
     nft -c -f $CONFIG_FILE || rollback
 
-    echo "[+] 应用配置（10秒内自动回滚保护）..."
-
-    # 启动回滚保护
-    (sleep 10 && echo "[!] 未确认，自动回滚..." && rollback) & ROLLBACK_PID=$!
+    echo "[+] 应用配置..."
 
     systemctl enable nftables
     systemctl restart nftables
-
-    echo "[+] 如果网络正常请输入 yes 确认："
-    read CONFIRM
-
-    if [ "$CONFIRM" == "yes" ]; then
-        kill $ROLLBACK_PID 2>/dev/null || true
-        echo "[+] 配置已确认 ✅"
-    else
-        rollback
-    fi
 }
 
 # =========================
-# 主菜单
+# 菜单
 # =========================
 
 menu() {
     clear
+
+    pub_ip=$(get_public_ip 2>/dev/null || echo "获取失败")
+
     echo "=============================="
     echo " nftables 转发管理工具"
     echo "=============================="
-    echo "公网 IP: $(get_public_ip)"
+    echo "公网 IP: $pub_ip"
     echo "出口网卡: $WAN_IF"
     echo "------------------------------"
     echo "1. 一键配置转发"
@@ -202,38 +195,40 @@ menu() {
 }
 
 # =========================
-# 功能实现
+# 主逻辑
 # =========================
 
 case_action() {
     case $1 in
         1)
-            echo "⚠️ 即将修改防火墙规则，可能影响 SSH"
-            read -p "确认继续？(y/n): " CONFIRM
+            echo "⚠️ 可能影响 SSH，请确认"
+            read -r -p "继续? (y/n): " CONFIRM || return
             [ "$CONFIRM" != "y" ] && return
 
             backup_config
             enable_forward
             disable_iptables
             install_nft
+
             add_rules
             set_snat
             write_config
             apply_config
-            read
+
+            read -r -p "完成，回车返回"
             ;;
         2)
             nft list ruleset
-            read -p "回车返回"
+            read -r -p "回车返回"
             ;;
         3)
             echo "flush ruleset" > $CONFIG_FILE
             systemctl restart nftables
             echo "已清空"
-            read
+            read -r -p "回车返回"
             ;;
         0)
-            exit
+            exit 0
             ;;
         *)
             echo "无效选择"
@@ -242,8 +237,12 @@ case_action() {
     esac
 }
 
+# =========================
+# 循环
+# =========================
+
 while true; do
     menu
-    read -p "请选择: " CHOICE
-    case_action $CHOICE
+    read -r -p "请选择: " CHOICE || continue
+    case_action "$CHOICE"
 done
