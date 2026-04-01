@@ -5,13 +5,11 @@ set -e
 CONFIG_FILE="/etc/nftables.conf"
 BACKUP_FILE="/etc/nftables.conf.bak"
 
-RULES=""
 SNAT_MODE="masquerade"
 SNAT_IP=""
 
-# 自动获取出口网卡（带兜底）
-WAN_IF=$(ip route | awk '/default/ {print $5; exit}')
-WAN_IF=${WAN_IF:-eth0}
+# 自动获取出口网卡
+WAN_IF=$(ip route get 1 2>/dev/null | awk '{print $5; exit}')
 
 # =========================
 # 工具函数
@@ -45,42 +43,48 @@ install_nft() {
 }
 
 backup_config() {
-    echo "[+] 备份配置..."
+    echo "[+] 备份旧配置..."
     cp $CONFIG_FILE $BACKUP_FILE 2>/dev/null || true
 }
 
 rollback() {
-    echo "[!] 发生错误，回滚配置..."
+    echo "[!] 配置失败，正在回滚..."
     cp $BACKUP_FILE $CONFIG_FILE 2>/dev/null || true
     systemctl restart nftables
     exit 1
 }
 
 # =========================
-# 输入规则
+# 规则存储（数组）
+# =========================
+
+RULES_TCP=()
+RULES_UDP=()
+
+# =========================
+# 规则输入
 # =========================
 
 add_rules() {
     while true; do
         echo "---------------------------"
-
-        read -r -p "入站端口（回车结束）: " IN_PORT || continue
+        read -r -p "入站端口（回车结束）: " IN_PORT
         [ -z "$IN_PORT" ] && break
 
-        read -r -p "目标 IP: " DEST_IP || continue
-        read -r -p "目标端口: " DEST_PORT || continue
-        read -r -p "协议 (tcp/udp/both): " PROTO || continue
+        read -r -p "目标 IP: " DEST_IP
+        read -r -p "目标端口: " DEST_PORT
+        read -r -p "协议 (tcp/udp/both): " PROTO
 
         case $PROTO in
             tcp)
-                RULES+="        iifname \"$WAN_IF\" tcp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT\n"
+                RULES_TCP+=("iifname \"$WAN_IF\" tcp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT")
                 ;;
             udp)
-                RULES+="        iifname \"$WAN_IF\" udp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT\n"
+                RULES_UDP+=("iifname \"$WAN_IF\" udp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT")
                 ;;
             both)
-                RULES+="        iifname \"$WAN_IF\" tcp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT\n"
-                RULES+="        iifname \"$WAN_IF\" udp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT\n"
+                RULES_TCP+=("iifname \"$WAN_IF\" tcp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT")
+                RULES_UDP+=("iifname \"$WAN_IF\" udp dport $IN_PORT dnat to $DEST_IP:$DEST_PORT")
                 ;;
             *)
                 echo "协议错误"
@@ -95,13 +99,13 @@ add_rules() {
 
 set_snat() {
     echo "SNAT 模式："
-    echo "1. 自动 (masquerade)"
+    echo "1. 自动 (masquerade) [推荐]"
     echo "2. 指定出口 IP"
 
-    read -r -p "选择: " CHOICE || return
+    read -r -p "选择: " CHOICE
 
     if [ "$CHOICE" == "2" ]; then
-        read -r -p "请输入出口 IP: " SNAT_IP || return
+        read -r -p "请输入出口 IP: " SNAT_IP
         SNAT_MODE="snat"
     else
         SNAT_MODE="masquerade"
@@ -124,9 +128,11 @@ cat > $CONFIG_FILE <<EOF
 flush ruleset
 
 table inet nat {
+
     chain prerouting {
         type nat hook prerouting priority dstnat;
-$RULES
+$(for r in "${RULES_TCP[@]}"; do echo "        $r"; done)
+$(for r in "${RULES_UDP[@]}"; do echo "        $r"; done)
     }
 
     chain postrouting {
@@ -136,6 +142,7 @@ $RULES
 }
 
 table inet filter {
+
     chain forward {
         type filter hook forward priority 0;
         policy drop;
@@ -151,7 +158,7 @@ table inet filter {
         iif lo accept
         ct state established,related accept
 
-        # 防 SSH 断线（重要）
+        # 防断线 SSH
         tcp dport 22 accept
     }
 }
@@ -159,17 +166,29 @@ EOF
 }
 
 # =========================
-# 应用配置
+# 应用配置（带回滚保护）
 # =========================
 
 apply_config() {
     echo "[+] 检查配置..."
     nft -c -f $CONFIG_FILE || rollback
 
-    echo "[+] 应用配置..."
+    echo "[+] 应用配置（10秒内自动回滚保护）..."
+
+    (sleep 10 && echo "[!] 未确认，自动回滚..." && rollback) & ROLLBACK_PID=$!
 
     systemctl enable nftables
     systemctl restart nftables
+
+    echo "[+] 如果网络正常请输入 yes 确认："
+    read -r CONFIRM
+
+    if [ "$CONFIRM" == "yes" ]; then
+        kill $ROLLBACK_PID 2>/dev/null || true
+        echo "[+] 配置已确认 ✅"
+    else
+        rollback
+    fi
 }
 
 # =========================
@@ -178,13 +197,10 @@ apply_config() {
 
 menu() {
     clear
-
-    pub_ip=$(get_public_ip 2>/dev/null || echo "获取失败")
-
     echo "=============================="
     echo " nftables 转发管理工具"
     echo "=============================="
-    echo "公网 IP: $pub_ip"
+    echo "公网 IP: $(get_public_ip)"
     echo "出口网卡: $WAN_IF"
     echo "------------------------------"
     echo "1. 一键配置转发"
@@ -194,28 +210,21 @@ menu() {
     echo "=============================="
 }
 
-# =========================
-# 主逻辑
-# =========================
-
 case_action() {
     case $1 in
         1)
-            echo "⚠️ 可能影响 SSH，请确认"
-            read -r -p "继续? (y/n): " CONFIRM || return
+            echo "⚠️ 即将修改防火墙规则"
+            read -r -p "确认继续？(y/n): " CONFIRM
             [ "$CONFIRM" != "y" ] && return
 
             backup_config
             enable_forward
             disable_iptables
             install_nft
-
             add_rules
             set_snat
             write_config
             apply_config
-
-            read -r -p "完成，回车返回"
             ;;
         2)
             nft list ruleset
@@ -228,7 +237,7 @@ case_action() {
             read -r -p "回车返回"
             ;;
         0)
-            exit 0
+            exit
             ;;
         *)
             echo "无效选择"
@@ -237,12 +246,8 @@ case_action() {
     esac
 }
 
-# =========================
-# 循环
-# =========================
-
 while true; do
     menu
-    read -r -p "请选择: " CHOICE || continue
-    case_action "$CHOICE"
+    read -r -p "请选择: " CHOICE
+    case_action $CHOICE
 done
