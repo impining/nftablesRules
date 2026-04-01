@@ -2,10 +2,6 @@
 
 set -e
 
-TABLE="ip nat"
-PREROUTING="prerouting"
-POSTROUTING="postrouting"
-
 WAN_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
 
 pause() {
@@ -14,111 +10,47 @@ pause() {
 }
 
 # =========================
-# 初始化基础环境
+# 状态检测
 # =========================
 
-init() {
-    echo "[+] 初始化环境..."
+detect_env() {
+    echo "=============================="
+    echo "[环境检测]"
+    echo "=============================="
 
-    command -v nft >/dev/null || apt update && apt install -y nftables
+    echo "[网卡] $WAN_IF"
 
-    systemctl enable nftables >/dev/null 2>&1 || true
-    systemctl start nftables
-
-    # 创建基础表（如果不存在）
-    nft list table ip nat >/dev/null 2>&1 || {
-        nft add table ip nat
-    }
-
-    # 创建 chain
-    nft list chain ip nat prerouting >/dev/null 2>&1 || \
-    nft add chain ip nat prerouting { type nat hook prerouting priority 0 \; }
-
-    nft list chain ip nat postrouting >/dev/null 2>&1 || \
-    nft add chain ip nat postrouting { type nat hook postrouting priority 100 \; }
-
-    # masquerade
-    nft list ruleset | grep masquerade >/dev/null 2>&1 || \
-    nft add rule ip nat postrouting oifname "$WAN_IF" masquerade
-
-    echo "[OK] 初始化完成"
-    pause
-}
-
-# =========================
-# IP 转发
-# =========================
-
-enable_forward() {
-    echo "[+] 开启 IP 转发..."
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || \
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    echo "[OK] 已开启"
-    pause
-}
-
-# =========================
-# DNS
-# =========================
-
-set_dns() {
-    read -r -p "DNS (默认 223.5.5.5): " DNS
-    DNS=${DNS:-223.5.5.5}
-    echo "nameserver $DNS" > /etc/resolv.conf
-    echo "[OK] DNS = $DNS"
-    pause
-}
-
-# =========================
-# 添加规则（增量）
-# =========================
-
-add_rule() {
-    read -r -p "外部端口: " PORT
-    read -r -p "目标IP: " DEST_IP
-    read -r -p "目标端口: " DEST_PORT
-
-    echo "[+] 添加规则..."
-
-    nft add rule ip nat prerouting tcp dport $PORT dnat to $DEST_IP:$DEST_PORT
-    nft add rule ip nat prerouting udp dport $PORT dnat to $DEST_IP:$DEST_PORT
-
-    echo "[OK] 规则已添加"
-    pause
-}
-
-# =========================
-# 查看规则（带编号）
-# =========================
-
-view_rules() {
-    echo "[+] 当前规则："
-    nft list chain ip nat prerouting
-    pause
-}
-
-# =========================
-# 删除规则（按端口匹配）
-# =========================
-
-delete_rule() {
-    read -r -p "输入端口（删除匹配规则）: " PORT
-
-    RULES=$(nft list chain ip nat prerouting | grep "$PORT")
-
-    if [ -z "$RULES" ]; then
-        echo "[!] 未找到规则"
-        pause
-        return
+    echo -n "[IP转发] "
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" == "1" ]; then
+        echo "开启"
+    else
+        echo "关闭"
     fi
 
-    echo "$RULES"
-    read -r -p "确认删除? (yes): " CONFIRM
+    echo "[iptables 规则数量]"
+    iptables -S 2>/dev/null | wc -l
 
-    if [ "$CONFIRM" == "yes" ]; then
-        nft delete rule ip nat prerouting handle $(nft -a list chain ip nat prerouting | grep "$PORT" | awk '{print $NF}')
-        echo "[OK] 已删除"
+    echo "[nftables 规则]"
+    nft list ruleset 2>/dev/null | head -n 5
+
+    echo "=============================="
+    pause
+}
+
+# =========================
+# 安全清理 iptables（可选）
+# =========================
+
+clear_iptables_safe() {
+    echo "[!] 即将清空 iptables 规则（危险操作）"
+    read -r -p "输入 YES 确认: " CONFIRM
+
+    if [ "$CONFIRM" == "YES" ]; then
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+        echo "[OK] iptables 已清空"
     else
         echo "[取消]"
     fi
@@ -127,18 +59,58 @@ delete_rule() {
 }
 
 # =========================
-# 状态
+# 开启 IP 转发（手动）
 # =========================
 
-status() {
-    echo "======================"
-    echo "网卡: $WAN_IF"
-    echo -n "IP转发: "
-    [ "$(cat /proc/sys/net/ipv4/ip_forward)" == "1" ] && echo "开启" || echo "关闭"
+enable_forward() {
+    echo "[!] 开启 IP 转发（系统级修改）"
+    read -r -p "输入 YES 确认: " CONFIRM
 
-    echo "[规则]"
-    nft list ruleset | grep nat
-    echo "======================"
+    if [ "$CONFIRM" == "YES" ]; then
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || \
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+        echo "[OK] 已开启"
+    else
+        echo "[取消]"
+    fi
+
+    pause
+}
+
+# =========================
+# nft NAT 增量规则
+# =========================
+
+add_nft_rule() {
+    echo "[+] 添加 NAT 转发规则"
+
+    read -r -p "外部端口: " PORT
+    read -r -p "目标IP: " DEST_IP
+    read -r -p "目标端口: " DEST_PORT
+
+    echo "[!] 确认添加规则:"
+    echo "    $PORT -> $DEST_IP:$DEST_PORT"
+    read -r -p "输入 YES 确认: " CONFIRM
+
+    if [ "$CONFIRM" == "YES" ]; then
+        nft add rule ip nat prerouting tcp dport $PORT dnat to $DEST_IP:$DEST_PORT
+        nft add rule ip nat prerouting udp dport $PORT dnat to $DEST_IP:$DEST_PORT
+        nft add rule ip nat postrouting oifname "$WAN_IF" masquerade
+        echo "[OK] 规则已添加"
+    else
+        echo "[取消]"
+    fi
+
+    pause
+}
+
+# =========================
+# 查看规则
+# =========================
+
+view_rules() {
+    nft list ruleset
     pause
 }
 
@@ -148,18 +120,16 @@ status() {
 
 menu() {
     clear
-    echo "====== NAT 专业版 ======"
+    echo "====== 安全生产版 NAT 管理 ======"
     echo "网卡: $WAN_IF"
-    echo "========================"
-    echo "1. 初始化"
-    echo "2. 添加端口转发"
-    echo "3. 删除端口转发"
-    echo "4. 查看规则"
-    echo "5. 开启 IP 转发"
-    echo "6. 设置 DNS"
-    echo "7. 查看状态"
+    echo "================================="
+    echo "1. 环境检测（只读）"
+    echo "2. 添加 NAT 转发（nft）"
+    echo "3. 查看规则"
+    echo "4. 开启 IP 转发（手动确认）"
+    echo "5. 清空 iptables（危险）"
     echo "0. 退出"
-    echo "========================"
+    echo "================================="
 }
 
 # =========================
@@ -171,13 +141,11 @@ while true; do
     read -r -p "请选择: " CHOICE
 
     case $CHOICE in
-        1) init ;;
-        2) add_rule ;;
-        3) delete_rule ;;
-        4) view_rules ;;
-        5) enable_forward ;;
-        6) set_dns ;;
-        7) status ;;
+        1) detect_env ;;
+        2) add_nft_rule ;;
+        3) view_rules ;;
+        4) enable_forward ;;
+        5) clear_iptables_safe ;;
         0) exit ;;
         *) echo "无效选项"; sleep 1 ;;
     esac
