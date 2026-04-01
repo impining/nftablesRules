@@ -5,27 +5,13 @@ set -e
 CONFIG_FILE="/etc/nftables.conf"
 BACKUP_FILE="/etc/nftables.conf.bak"
 
-WAN_IF=$(ip route get 1 2>/dev/null | awk '{print $5; exit}')
-
-RULES_V4=()
-RULES_V6=()
-
-SNAT_MODE="masquerade"
-SNAT_IP=""
+WAN_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
 
 # =========================
-# 工具函数
+# 基础函数
 # =========================
 
-is_ipv6() {
-    [[ "$1" == *:* ]]
-}
-
-get_public_ip() {
-    curl -s ifconfig.me || echo "unknown"
-}
-
-backup_config() {
+backup() {
     cp $CONFIG_FILE $BACKUP_FILE 2>/dev/null || true
 }
 
@@ -36,132 +22,104 @@ rollback() {
     exit 1
 }
 
-# =========================
-# 输入规则
-# =========================
+enable_forward() {
+    echo "[+] 开启 IP 转发..."
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || \
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+}
 
-add_rules() {
-    while true; do
-        echo "---------------------------"
-        read -r -p "入站端口（回车结束）: " IN_PORT
-        [ -z "$IN_PORT" ] && break
+set_dns() {
+    echo "[+] 设置 DNS..."
 
-        read -r -p "目标 IP: " DEST_IP
-        read -r -p "目标端口: " DEST_PORT
-        read -r -p "协议 (tcp/udp/both): " PROTO
+    read -r -p "DNS (默认 223.5.5.5): " DNS
+    DNS=${DNS:-223.5.5.5}
 
-        if is_ipv6 "$DEST_IP"; then
-            TABLE="ip6"
-            DEST_FMT="[${DEST_IP}]"
-        else
-            TABLE="ip"
-            DEST_FMT="$DEST_IP"
-        fi
+    echo "nameserver $DNS" > /etc/resolv.conf
+}
 
-        add_rule() {
-            local proto=$1
-            local rule="$proto dport $IN_PORT dnat to $DEST_FMT:$DEST_PORT"
-            if [ "$TABLE" == "ip" ]; then
-                RULES_V4+=("iifname \"$WAN_IF\" $rule")
-            else
-                RULES_V6+=("iifname \"$WAN_IF\" $rule")
-            fi
-        }
-
-        case $PROTO in
-            tcp) add_rule "tcp" ;;
-            udp) add_rule "udp" ;;
-            both)
-                add_rule "tcp"
-                add_rule "udp"
-                ;;
-        esac
-    done
+install_nft() {
+    command -v nft >/dev/null || (apt update && apt install -y nftables)
 }
 
 # =========================
-# SNAT
-# =========================
-
-set_snat() {
-    echo "SNAT 模式:"
-    echo "1. masquerade"
-    echo "2. 指定 IP"
-    read -r -p "选择: " CHOICE
-
-    if [ "$CHOICE" == "2" ]; then
-        read -r -p "出口 IP: " SNAT_IP
-        SNAT_MODE="snat"
-    fi
-}
-
-# =========================
-# 写配置
+# 生成配置
 # =========================
 
 write_config() {
-
-if [ "$SNAT_MODE" == "snat" ]; then
-    SNAT_RULE="oifname \"$WAN_IF\" snat to $SNAT_IP"
-else
-    SNAT_RULE="oifname \"$WAN_IF\" masquerade"
-fi
 
 cat > $CONFIG_FILE <<EOF
 flush ruleset
 
 table ip nat {
+
     chain prerouting {
         type nat hook prerouting priority dstnat;
-$(for r in "${RULES_V4[@]}"; do echo "        $r"; done)
+$(generate_rules)
     }
 
     chain postrouting {
         type nat hook postrouting priority srcnat;
-        $SNAT_RULE
+        oifname "$WAN_IF" masquerade
     }
 }
 
-table ip6 nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat;
-$(for r in "${RULES_V6[@]}"; do echo "        $r"; done)
-    }
+table ip filter {
 
-    chain postrouting {
-        type nat hook postrouting priority srcnat;
-        $SNAT_RULE
-    }
-}
-
-table inet filter {
     chain forward {
         type filter hook forward priority 0;
-        policy drop;
-        ct state established,related accept
-        ct state new accept
+        policy accept;
     }
 
     chain input {
         type filter hook input priority 0;
-        policy drop;
-        iif lo accept
-        ct state established,related accept
-        tcp dport 22 accept
+        policy accept;
     }
 }
 EOF
+}
+
+RULES=()
+
+add_rule() {
+    local port=$1
+    local ip=$2
+    local dport=$3
+
+    RULES+=("tcp dport $port dnat to $ip:$dport")
+    RULES+=("udp dport $port dnat to $ip:$dport")
+}
+
+generate_rules() {
+    for r in "${RULES[@]}"; do
+        echo "        $r"
+    done
+}
+
+# =========================
+# 输入规则
+# =========================
+
+add_forward() {
+    while true; do
+        echo "---------------------------"
+        read -r -p "外部端口(回车结束): " PORT
+        [ -z "$PORT" ] && break
+
+        read -r -p "目标IP: " DEST_IP
+        read -r -p "目标端口: " DEST_PORT
+
+        add_rule "$PORT" "$DEST_IP" "$DEST_PORT"
+    done
 }
 
 # =========================
 # 应用
 # =========================
 
-apply_config() {
+apply() {
     echo "[+] 校验配置..."
     nft -c -f $CONFIG_FILE || rollback
-
-    echo "[+] 应用配置（10秒保护）..."
 
     (sleep 10 && echo "[!] 自动回滚" && rollback) & RPID=$!
 
@@ -179,15 +137,81 @@ apply_config() {
 }
 
 # =========================
-# 主流程
+# 查看 / 清空
 # =========================
 
-echo "公网IP: $(get_public_ip)"
-echo "网卡: $WAN_IF"
+view_rules() {
+    nft list ruleset
+    read
+}
 
-backup_config
+clear_rules() {
+    echo "flush ruleset" > $CONFIG_FILE
+    systemctl restart nftables
+    echo "[+] 已清空"
+    read
+}
 
-add_rules
-set_snat
-write_config
-apply_config
+# =========================
+# 初始化
+# =========================
+
+init_system() {
+    install_nft
+    enable_forward
+    set_dns
+    backup
+}
+
+# =========================
+# 菜单
+# =========================
+
+menu() {
+    clear
+    echo "=============================="
+    echo " NAT 面板（IPv4 版）"
+    echo " 网卡: $WAN_IF"
+    echo "=============================="
+    echo "1. 添加端口转发"
+    echo "2. 查看规则"
+    echo "3. 清空规则"
+    echo "4. 设置 DNS"
+    echo "5. 开启 IP 转发"
+    echo "0. 退出"
+    echo "=============================="
+}
+
+# =========================
+# 主循环
+# =========================
+
+init_system
+
+while true; do
+    menu
+    read -r -p "请选择: " CHOICE
+
+    case $CHOICE in
+        1)
+            add_forward
+            write_config
+            apply
+            ;;
+        2)
+            view_rules
+            ;;
+        3)
+            clear_rules
+            ;;
+        4)
+            set_dns
+            ;;
+        5)
+            enable_forward
+            ;;
+        0)
+            exit
+            ;;
+    esac
+done
