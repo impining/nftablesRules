@@ -1,6 +1,6 @@
 # nftablesRules
 
 使用
-bash <(curl -s https://raw.githubusercontent.com/impining/nftablesRules/main/nft-forward.sh)
+curl -s https://raw.githubusercontent.com/impining/nftablesRules/main/nft-forward.sh | tr -d '\r' | bash
 
 简单脚本
